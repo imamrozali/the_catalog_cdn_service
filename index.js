@@ -11,13 +11,11 @@ import sharp from "sharp";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const PORT = parseInt(process.env.PORT || "4001", 10);
-const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || path.join(__dirname, "..", "uploads"));
+const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || path.join(__dirname, "uploads"));
 const CDN_PREFIX = process.env.CDN_PREFIX || "/cdn";
 const CDN_API_KEY = process.env.CDN_API_KEY;
 const MAX_FILE_SIZE = parseInt(process.env.MAX_FILE_SIZE || "10485760", 10);
 const MAX_FILES = 10;
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "https://reevantstore.com").split(",").map((s) => s.trim()).filter(Boolean);
-
 // Rate limiter (in-memory)
 const rateLimitMap = new Map();
 const RATE_LIMIT_WINDOW = 60_000;
@@ -51,19 +49,16 @@ setInterval(() => {
 const app = express();
 
 app.disable("x-powered-by");
+app.set("trust proxy", true);
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" },
   contentSecurityPolicy: false,
 }));
 app.use(cors({
-  origin: (origin, cb) => {
-    // Allow requests with no origin (server-to-server, curl, etc.)
-    if (!origin) return cb(null, true);
-    if (ALLOWED_ORIGINS.some((o) => origin.startsWith(o))) {
-      return cb(null, true);
-    }
-    cb(null, false);
-  },
+  origin: ["https://reevantstore.com", "http://localhost:3000"],
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  maxAge: 86400,
 }));
 app.use(express.json({ limit: "1mb" }));
 
@@ -284,5 +279,5 @@ app.use((err, _req, res, _next) => {
 app.listen(PORT, () => {
   console.log(`CDN server running on http://localhost:${PORT}`);
   console.log(`Upload directory: ${UPLOAD_DIR}`);
-  console.log(`Allowed origins: ${ALLOWED_ORIGINS.join(", ") || "none"}`);
+  console.log(`CORS: ${JSON.stringify(["https://reevantstore.com", "http://localhost:3000"])}`);
 });
