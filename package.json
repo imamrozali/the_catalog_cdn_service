@@ -1,11 +1,11 @@
 {
-  "name": "porto-cdn",
+  "name": "the_catalog_cdn_service",
   "version": "1.0.0",
   "private": true,
   "type": "module",
   "scripts": {
-"dev": "node --watch index.js",
-"start": "node index.js"
+    "dev": "node --watch index.js",
+    "start": "node index.js"
   },
   "dependencies": {
     "busboy": "^1.6.0",

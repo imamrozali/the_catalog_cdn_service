@@ -1,0 +1,50 @@
+name: Deploy CDN Service to Plesk
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup NodeJS
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Create .env
+        run: |
+          echo "CDN_API_KEY=${{ secrets.CDN_API_KEY }}" >> .env
+          echo "PORT=4001" >> .env
+          echo "CDN_PREFIX=/cdn" >> .env
+          echo "UPLOAD_DIR=./uploads/products" >> .env
+          echo "MAX_FILE_SIZE=10485760" >> .env
+          echo "LOG_LEVEL=info" >> .env
+
+      - name: Prepare Deploy Folder
+        run: |
+          mkdir -p deploy
+          cp -r node_modules deploy/node_modules
+          cp index.js deploy/index.js
+          cp package.json deploy/package.json
+          cp package-lock.json deploy/package-lock.json || true
+          cp .env deploy/.env
+          mkdir -p deploy/uploads
+
+      - name: FTP Deploy
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ${{ secrets.CDN_FTP_SERVER }}
+          username: ${{ secrets.CDN_FTP_USERNAME }}
+          password: ${{ secrets.CDN_FTP_PASSWORD }}
+          local-dir: ./deploy/
+          server-dir: /httpdocs/

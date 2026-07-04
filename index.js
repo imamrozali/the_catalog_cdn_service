@@ -1,283 +1,460 @@
+
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import path from "path";
 import fs from "fs/promises";
+import { createWriteStream } from "fs";
 import { fileURLToPath } from "url";
 import crypto from "crypto";
 import sharp from "sharp";
+import Busboy from "busboy";
+import os from "os";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const PORT = parseInt(process.env.PORT || "4001", 10);
-const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || path.join(__dirname, "uploads"));
-const CDN_PREFIX = process.env.CDN_PREFIX || "/cdn";
-const CDN_API_KEY = process.env.CDN_API_KEY;
-const MAX_FILE_SIZE = parseInt(process.env.MAX_FILE_SIZE || "10485760", 10);
-const MAX_FILES = 10;
-// Rate limiter (in-memory)
-const rateLimitMap = new Map();
-const RATE_LIMIT_WINDOW = 60_000;
-const RATE_LIMIT_MAX = 30;
+const app = express();
 
-function rateLimit(req) {
-  const ip = req.ip || req.headers["x-forwarded-for"] || req.connection.remoteAddress || "unknown";
-  const now = Date.now();
-  const entry = rateLimitMap.get(ip);
-  if (!entry || now - entry.windowStart > RATE_LIMIT_WINDOW) {
-    rateLimitMap.set(ip, { windowStart: now, count: 1 });
-    return { allowed: true, remaining: RATE_LIMIT_MAX - 1 };
+const PORT = Number(process.env.PORT || 4001);
+
+const UPLOAD_DIR = path.resolve(
+  process.env.UPLOAD_DIR || path.join(__dirname, "uploads")
+);
+
+const TEMP_DIR = path.join(os.tmpdir(), "cdn-temp");
+
+const CDN_PREFIX = process.env.CDN_PREFIX || "/cdn";
+
+const CDN_API_KEY = process.env.CDN_API_KEY;
+
+const MAX_FILE_SIZE = Number(
+  process.env.MAX_FILE_SIZE || 10 * 1024 * 1024
+);
+
+const MAX_FILES = 10;
+
+const ALLOWED_MIME = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/avif",
+]);
+
+// ======================
+// Logger
+// ======================
+
+const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
+
+const CURRENT_LEVEL = LOG_LEVELS[process.env.LOG_LEVEL] ?? LOG_LEVELS.info;
+
+function log(level, msg, ...args) {
+  if (LOG_LEVELS[level] < CURRENT_LEVEL) return;
+  const ts = new Date().toISOString();
+  const prefix = `[${ts}] [${level.toUpperCase()}]`;
+  if (level === "error" || level === "warn") {
+    console.error(prefix, msg, ...args);
+  } else {
+    console.log(prefix, msg, ...args);
   }
-  entry.count++;
-  if (entry.count > RATE_LIMIT_MAX) {
-    return { allowed: false, remaining: 0, resetIn: RATE_LIMIT_WINDOW - (now - entry.windowStart) };
-  }
-  return { allowed: true, remaining: RATE_LIMIT_MAX - entry.count };
 }
 
-// Periodic cleanup of rate limit map
+const logger = {
+  debug: (msg, ...args) => log("debug", msg, ...args),
+  info: (msg, ...args) => log("info", msg, ...args),
+  warn: (msg, ...args) => log("warn", msg, ...args),
+  error: (msg, ...args) => log("error", msg, ...args),
+};
+
+// ======================
+// Sharp Optimization
+// ======================
+
+sharp.cache(false);
+
+sharp.concurrency(2);
+
+logger.info("Starting CDN service", { port: PORT, uploadDir: UPLOAD_DIR, logLevel: process.env.LOG_LEVEL || "info" });
+
+// ======================
+// Trust Proxy
+// ======================
+
+app.set("trust proxy", true);
+
+app.disable("x-powered-by");
+
+// ======================
+// Middleware
+// ======================
+
+app.use(
+  helmet({
+    crossOriginResourcePolicy: {
+      policy: "cross-origin",
+    },
+    contentSecurityPolicy: false,
+  })
+);
+
+app.use(
+  cors({
+    origin: [
+      "https://reevantstore.com",
+      "https://www.reevantstore.com",
+      "http://localhost:3000",
+    ],
+    methods: ["GET", "POST", "DELETE"],
+    maxAge: 86400,
+  })
+);
+
+app.use(express.json({ limit: "1mb" }));
+
+// ======================
+// Ensure Directory
+// ======================
+
+await fs.mkdir(UPLOAD_DIR, { recursive: true });
+
+await fs.mkdir(TEMP_DIR, { recursive: true });
+
+// ======================
+// Simple Rate Limit
+// ======================
+
+const requests = new Map();
+
+const WINDOW = 60_000;
+
+const LIMIT = 30;
+
+function rateLimit(req, res, next) {
+  const ip =
+    req.ip ||
+    req.headers["x-forwarded-for"] ||
+    "unknown";
+
+  const now = Date.now();
+
+  let data = requests.get(ip);
+
+  if (!data || now - data.start > WINDOW) {
+    data = {
+      start: now,
+      count: 0,
+    };
+  }
+
+  data.count++;
+
+  requests.set(ip, data);
+
+  if (data.count > LIMIT) {
+    return res.status(429).json({
+      error: "Too many requests",
+    });
+  }
+
+  next();
+}
+
+// Cleanup
 setInterval(() => {
   const now = Date.now();
-  for (const [ip, entry] of rateLimitMap) {
-    if (now - entry.windowStart > RATE_LIMIT_WINDOW * 2) {
-      rateLimitMap.delete(ip);
+
+  for (const [ip, data] of requests) {
+    if (now - data.start > WINDOW * 2) {
+      requests.delete(ip);
     }
   }
 }, 60_000);
 
-const app = express();
+// ======================
+// Auth
+// ======================
 
-app.disable("x-powered-by");
-app.set("trust proxy", true);
-app.use(helmet({
-  crossOriginResourcePolicy: { policy: "cross-origin" },
-  contentSecurityPolicy: false,
-}));
-app.use(cors({
-  origin: ["https://reevantstore.com", "http://localhost:3000"],
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-  maxAge: 86400,
-}));
-app.use(express.json({ limit: "1mb" }));
-
-// Ensure upload directory exists on startup
-await fs.mkdir(UPLOAD_DIR, { recursive: true });
-
-// --- Auth middleware ---
 function authenticate(req, res, next) {
-  const auth = req.headers["authorization"];
-  if (!auth || !auth.startsWith("Bearer ")) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-  const token = auth.slice(7);
-  if (!token || token !== CDN_API_KEY) {
-    return res.status(401).json({ error: "Invalid API key" });
-  }
-  next();
-}
+  const auth = req.headers.authorization;
 
-// --- Validate filename (prevent path traversal) ---
-function validateFilename(name) {
-  if (!name || typeof name !== "string") return false;
-  if (name.includes("..") || name.includes("/") || name.includes("\\")) return false;
-  if (!/^[a-zA-Z0-9._-]+$/.test(name)) return false;
-  return true;
-}
-
-// --- Health check (no auth, no rate limit) ---
-app.get("/health", (_req, res) => {
-  res.json({ status: "ok", uptime: process.uptime() });
-});
-
-// --- Upload ---
-app.post("/upload", authenticate, async (req, res) => {
-  const rl = rateLimit(req);
-  if (!rl.allowed) {
-    return res.status(429).json({
-      error: "Too many requests",
-      retryAfter: Math.ceil(rl.resetIn / 1000),
+  if (!auth?.startsWith("Bearer ")) {
+    return res.status(401).json({
+      error: "Unauthorized",
     });
   }
 
-  try {
-    const contentType = req.headers["content-type"] || "";
+  const token = auth.slice(7);
+
+  if (token !== CDN_API_KEY) {
+    return res.status(401).json({
+      error: "Invalid API key",
+    });
+  }
+
+  next();
+}
+
+// ======================
+// Health
+// ======================
+
+app.get("/health", (_req, res) => {
+  res.json({
+    status: "ok",
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+  });
+});
+
+// ======================
+// Upload
+// ======================
+
+app.post(
+  "/upload",
+  authenticate,
+  rateLimit,
+  async (req, res) => {
+    const contentType =
+      req.headers["content-type"] || "";
+
     if (!contentType.includes("multipart/form-data")) {
-      return res.status(400).json({ error: "Expected multipart/form-data" });
+      return res.status(400).json({
+        error: "multipart/form-data required",
+      });
     }
 
-    const busboy = (await import("busboy")).default;
-    const bb = busboy({ headers: req.headers, limits: { fileSize: MAX_FILE_SIZE, files: MAX_FILES } });
+    const bb = Busboy({
+      headers: req.headers,
+      limits: {
+        fileSize: MAX_FILE_SIZE,
+        files: MAX_FILES,
+      },
+    });
 
-    const type = new URL(req.url, `http://localhost:${PORT}`).searchParams.get("type") || "products";
+    const uploaded = [];
 
-    const filePromises = [];
-    let rejected = false;
+    let hasError = false;
 
-    bb.on("file", (_fieldname, stream, info) => {
-      if (rejected) return stream.resume();
+    const jobs = [];
 
-      // Validate MIME type
-      const allowed = ["image/jpeg", "image/png", "image/webp", "image/avif", "image/gif"];
-      if (!allowed.includes(info.mimeType)) {
-        rejected = true;
-        stream.resume();
-        if (!res.headersSent) {
-          res.status(400).json({ error: `Unsupported file type: ${info.mimeType}` });
-        }
+    bb.on("file", (_name, file, info) => {
+      if (hasError) {
+        file.resume();
         return;
       }
 
-      const p = new Promise((resolve) => {
-        const chunks = [];
-        let totalSize = 0;
+      if (!ALLOWED_MIME.has(info.mimeType)) {
+        hasError = true;
 
-        stream.on("data", (chunk) => {
-          totalSize += chunk.length;
-          if (totalSize > MAX_FILE_SIZE) {
-            rejected = true;
-            stream.resume();
-            if (!res.headersSent) {
-              res.status(400).json({ error: `File exceeds ${MAX_FILE_SIZE / 1024 / 1024}MB limit` });
-            }
-            resolve(null);
-            return;
-          }
-          chunks.push(chunk);
+        file.resume();
+
+        return res.status(400).json({
+          error: `Unsupported file: ${info.mimeType}`,
         });
+      }
 
-        stream.on("end", async () => {
-          if (rejected) { resolve(null); return; }
+      const tempName = crypto.randomUUID();
+
+      const tempPath = path.join(
+        TEMP_DIR,
+        `${tempName}.tmp`
+      );
+
+      const tempWrite = createWriteStream(tempPath);
+
+      file.pipe(tempWrite);
+
+      const job = new Promise((resolve) => {
+        tempWrite.on("finish", async () => {
           try {
             const filename = `${crypto.randomUUID()}.webp`;
-            const buffer = Buffer.concat(chunks);
 
-            const img = sharp(buffer).rotate();
-            if (type === "payment") {
-              img.resize(1200, 1600, { fit: "inside", withoutEnlargement: true });
-            } else {
-              img.resize(800, 800, { fit: "inside", withoutEnlargement: true });
-            }
-            const outputBuffer = await img.webp({ quality: 80 }).toBuffer();
+            const outputPath = path.join(
+              UPLOAD_DIR,
+              filename
+            );
 
-            const filePath = path.join(UPLOAD_DIR, filename);
-            await fs.writeFile(filePath, outputBuffer);
-            resolve(`${CDN_PREFIX}/${filename}`);
+            await sharp(tempPath)
+              .rotate()
+              .resize(1200, 1200, {
+                fit: "inside",
+                withoutEnlargement: true,
+              })
+              .webp({
+                quality: 82,
+                effort: 4,
+              })
+              .toFile(outputPath);
+
+            await fs.unlink(tempPath).catch(() => {});
+
+            uploaded.push(
+              `${CDN_PREFIX}/${filename}`
+            );
+
+            resolve();
           } catch (err) {
-            console.error("Process file error:", err);
-            resolve(null);
+            logger.error("Sharp processing failed:", err.message, { tempPath });
+
+            await fs.unlink(tempPath).catch(() => {});
+
+            resolve();
           }
         });
       });
 
-      filePromises.push(p);
+      jobs.push(job);
     });
 
     bb.on("filesLimit", () => {
-      rejected = true;
-      if (!res.headersSent) {
-        res.status(400).json({ error: `Maximum ${MAX_FILES} files allowed` });
-      }
+      hasError = true;
+
+      return res.status(400).json({
+        error: `Maximum ${MAX_FILES} files`,
+      });
     });
 
     bb.on("finish", async () => {
-      if (res.headersSent) return;
-      const urls = (await Promise.all(filePromises)).filter(Boolean);
-      if (urls.length === 0) {
-        return res.status(400).json({ error: "No files uploaded" });
+      if (hasError || res.headersSent) return;
+
+      await Promise.all(jobs);
+
+      if (!uploaded.length) {
+        return res.status(400).json({
+          error: "No uploaded files",
+        });
       }
-      res.json({ urls });
+
+      return res.json({
+        success: true,
+        files: uploaded,
+      });
+    });
+
+    bb.on("error", (err) => {
+      logger.error("Busboy error:", err.message);
+
+      if (!res.headersSent) {
+        return res.status(500).json({
+          error: "Upload failed",
+        });
+      }
     });
 
     req.pipe(bb);
-  } catch (error) {
-    console.error("Upload error:", error);
-    res.status(500).json({ error: "Upload failed" });
   }
-});
+);
 
-// --- Delete files ---
-app.post("/delete", authenticate, async (req, res) => {
-  const rl = rateLimit(req);
-  if (!rl.allowed) {
-    return res.status(429).json({
-      error: "Too many requests",
-      retryAfter: Math.ceil(rl.resetIn / 1000),
-    });
-  }
+// ======================
+// Delete
+// ======================
 
-  try {
-    const { urls } = req.body;
+app.post(
+  "/delete",
+  authenticate,
+  rateLimit,
+  async (req, res) => {
+    try {
+      const { urls } = req.body;
 
-    if (!urls || !Array.isArray(urls) || urls.length === 0) {
-      return res.status(400).json({ error: "urls array is required" });
-    }
-
-    if (urls.length > 50) {
-      return res.status(400).json({ error: "Maximum 50 files per request" });
-    }
-
-    const results = [];
-    for (const url of urls) {
-      const prefix = CDN_PREFIX + "/";
-      const filename = url.startsWith(prefix) ? url.slice(prefix.length) : url.split("/").pop();
-
-      if (!validateFilename(filename)) {
-        results.push({ url, deleted: false, reason: "invalid_filename" });
-        continue;
+      if (!Array.isArray(urls)) {
+        return res.status(400).json({
+          error: "urls array required",
+        });
       }
 
-      const filePath = path.join(UPLOAD_DIR, filename);
+      const results = [];
 
-      // Ensure file is within upload directory (path traversal protection)
-      if (!filePath.startsWith(UPLOAD_DIR)) {
-        results.push({ url, deleted: false, reason: "invalid_path" });
-        continue;
-      }
+      for (const url of urls) {
+        const filename = path.basename(url);
 
-      try {
-        await fs.unlink(filePath);
-        results.push({ url, deleted: true });
-      } catch (err) {
-        if (err.code === "ENOENT") {
-          results.push({ url, deleted: false, reason: "not_found" });
-        } else {
-          results.push({ url, deleted: false, reason: err.message });
+        // Prevent path traversal
+        if (!filename || filename.includes("..")) {
+          results.push({ file: url, deleted: false, reason: "invalid" });
+          continue;
+        }
+
+        const filePath = path.join(UPLOAD_DIR, filename);
+
+        if (!filePath.startsWith(UPLOAD_DIR)) {
+          results.push({ file: url, deleted: false, reason: "invalid" });
+          continue;
+        }
+
+        try {
+          await fs.unlink(filePath);
+          results.push({ file: url, deleted: true });
+        } catch (err) {
+          results.push({
+            file: url,
+            deleted: false,
+            reason: err.code === "ENOENT" ? "not_found" : "error",
+          });
         }
       }
+
+      res.json({ results });
+    } catch (err) {
+      logger.error("Delete endpoint error:", err.message);
+      res.status(500).json({ error: "Delete failed" });
     }
-
-    res.json({ results });
-  } catch (error) {
-    console.error("Delete error:", error);
-    res.status(500).json({ error: "Delete failed" });
   }
+);
+
+// ======================
+// Root & Favicon
+// ======================
+
+app.get("/", (_req, res) => {
+  res.json({ service: "Reevant Store CDN", status: "running" });
 });
 
-// --- Serve static files ---
-const staticOpts = {
-  maxAge: "365d",
-  immutable: true,
-  dotfiles: "deny",
-  index: false,
-};
-app.use(CDN_PREFIX, express.static(UPLOAD_DIR, staticOpts));
-app.use("/uploads", express.static(UPLOAD_DIR, staticOpts));
+app.get("/favicon.ico", (_req, res) => res.status(204).end());
 
-// --- 404 handler ---
+// ======================
+// Static CDN
+// ======================
+
+app.use(
+  CDN_PREFIX,
+  express.static(UPLOAD_DIR, {
+    immutable: true,
+    maxAge: "365d",
+    etag: true,
+    index: false,
+    dotfiles: "deny",
+  })
+);
+
+// ======================
+// 404
+// ======================
+
 app.use((_req, res) => {
-  res.status(404).json({ error: "Not found" });
+  res.status(404).json({
+    error: "Not found",
+  });
 });
 
-// --- Error handler ---
+// ======================
+// Error
+// ======================
+
 app.use((err, _req, res, _next) => {
-  console.error("Unhandled error:", err);
-  res.status(500).json({ error: "Internal server error" });
+  logger.error("Unhandled error:", err?.message || err, { stack: err?.stack });
+
+  res.status(500).json({
+    error: "Internal server error",
+  });
 });
+
+// ======================
+// Start
+// ======================
 
 app.listen(PORT, () => {
-  console.log(`CDN server running on http://localhost:${PORT}`);
-  console.log(`Upload directory: ${UPLOAD_DIR}`);
-  console.log(`CORS: ${JSON.stringify(["https://reevantstore.com", "http://localhost:3000"])}`);
+  logger.info(`CDN server listening on port ${PORT}`);
 });
+
