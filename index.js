@@ -8,7 +8,6 @@ import fs from "fs/promises";
 import { createWriteStream } from "fs";
 import { fileURLToPath } from "url";
 import crypto from "crypto";
-import sharp from "sharp";
 import Busboy from "busboy";
 import os from "os";
 
@@ -34,12 +33,15 @@ const MAX_FILE_SIZE = Number(
 
 const MAX_FILES = 10;
 
-const ALLOWED_MIME = new Set([
-  "image/jpeg",
-  "image/png",
-  "image/webp",
-  "image/avif",
-]);
+const MIME_EXT = {
+  "image/jpeg": ".jpg",
+  "image/png": ".png",
+  "image/webp": ".webp",
+  "image/avif": ".avif",
+  "image/gif": ".gif",
+};
+
+const ALLOWED_MIME = new Set(Object.keys(MIME_EXT));
 
 // ======================
 // Logger
@@ -66,14 +68,6 @@ const logger = {
   warn: (msg, ...args) => log("warn", msg, ...args),
   error: (msg, ...args) => log("error", msg, ...args),
 };
-
-// ======================
-// Sharp Optimization
-// ======================
-
-sharp.cache(false);
-
-sharp.concurrency(2);
 
 logger.info("Starting CDN service", { port: PORT, uploadDir: UPLOAD_DIR, logLevel: process.env.LOG_LEVEL || "info" });
 
@@ -113,12 +107,14 @@ app.use(
 app.use(express.json({ limit: "1mb" }));
 
 // ======================
-// Ensure Directory
+// Ensure Directory (synchronous mkdir to avoid top-level await)
 // ======================
 
-await fs.mkdir(UPLOAD_DIR, { recursive: true });
+import { mkdirSync } from "fs";
 
-await fs.mkdir(TEMP_DIR, { recursive: true });
+mkdirSync(UPLOAD_DIR, { recursive: true });
+
+mkdirSync(TEMP_DIR, { recursive: true });
 
 // ======================
 // Simple Rate Limit
@@ -269,37 +265,17 @@ app.post(
       const job = new Promise((resolve) => {
         tempWrite.on("finish", async () => {
           try {
-            const filename = `${crypto.randomUUID()}.webp`;
+            const ext = MIME_EXT[info.mimeType] || ".bin";
+            const filename = `${crypto.randomUUID()}${ext}`;
+            const outputPath = path.join(UPLOAD_DIR, filename);
 
-            const outputPath = path.join(
-              UPLOAD_DIR,
-              filename
-            );
+            await fs.rename(tempPath, outputPath);
 
-            await sharp(tempPath)
-              .rotate()
-              .resize(1200, 1200, {
-                fit: "inside",
-                withoutEnlargement: true,
-              })
-              .webp({
-                quality: 82,
-                effort: 4,
-              })
-              .toFile(outputPath);
-
-            await fs.unlink(tempPath).catch(() => {});
-
-            uploaded.push(
-              `${CDN_PREFIX}/${filename}`
-            );
-
+            uploaded.push(`${CDN_PREFIX}/${filename}`);
             resolve();
           } catch (err) {
-            logger.error("Sharp processing failed:", err.message, { tempPath });
-
+            logger.error("File save failed:", err.message, { tempPath });
             await fs.unlink(tempPath).catch(() => {});
-
             resolve();
           }
         });
@@ -327,10 +303,7 @@ app.post(
         });
       }
 
-      return res.json({
-        success: true,
-        files: uploaded,
-      });
+      return res.json({ urls: uploaded });
     });
 
     bb.on("error", (err) => {

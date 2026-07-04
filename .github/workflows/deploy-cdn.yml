@@ -18,9 +18,6 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install Dependencies
-        run: npm ci
-
       - name: Create .env
         run: |
           echo "CDN_API_KEY=${{ secrets.CDN_API_KEY }}" >> .env
@@ -33,7 +30,6 @@ jobs:
       - name: Prepare Deploy Folder
         run: |
           mkdir -p deploy
-          cp -r node_modules deploy/node_modules
           cp index.js deploy/index.js
           cp package.json deploy/package.json
           cp package-lock.json deploy/package-lock.json || true
@@ -47,4 +43,4 @@ jobs:
           username: ${{ secrets.CDN_FTP_USERNAME }}
           password: ${{ secrets.CDN_FTP_PASSWORD }}
           local-dir: ./deploy/
-          server-dir: /httpdocs/
+          server-dir: /cdn.reevantstore.com/
